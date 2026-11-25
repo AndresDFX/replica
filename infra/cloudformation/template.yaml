@@ -270,6 +270,10 @@ Resources:
       KeySchema:
         - AttributeName: configId
           KeyType: HASH
+      # Sesiones del panel (sess#), freno de intentos (authfail#) y login temporal caducan solos.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
       Tags:
         - Key: Project
           Value: !Ref ProjectName

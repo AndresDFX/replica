@@ -571,6 +571,55 @@ class DynamoDbConfigStore(ConfigStore):
     def set_resets(self, codes: dict) -> None:
         self._t().put_item(Item={"configId": self._RESET_ID, "codes": codes})
 
+    # --- sesiones del panel (SEC-05) y freno de intentos (SEC-08) ---
+    # Un item por sesión, con clave = sha256 del id (el id en claro solo vive en la cookie HttpOnly).
+    # `ttl` lo limpia DynamoDB si la tabla tiene TTL; la validez real la decide `exp` al leer.
+
+    def put_session(self, sid_hash: str, data: dict) -> None:
+        self._t().put_item(Item={"configId": "sess#" + sid_hash, **data, "ttl": int(data.get("exp", 0))})
+
+    def get_session(self, sid_hash: str) -> dict:
+        item = self._t().get_item(Key={"configId": "sess#" + sid_hash}).get("Item") or {}
+        return {k: v for k, v in item.items() if k != "configId"}
+
+    def delete_session(self, sid_hash: str) -> None:
+        try:
+            self._t().delete_item(Key={"configId": "sess#" + sid_hash})
+        except Exception:
+            pass
+
+    def auth_fail_incr(self, usuario: str, lock_after: int, lock_secs: int) -> float:
+        """Suma un fallo de forma ATÓMICA (compartido entre contenedores). Devuelve locked_until."""
+        now = int(time.time())
+        r = self._t().update_item(
+            Key={"configId": "authfail#" + usuario},
+            UpdateExpression="ADD fails :one SET #ttl = :ttl",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={":one": 1, ":ttl": now + 900},
+            ReturnValues="ALL_NEW",
+        )
+        item = r.get("Attributes") or {}
+        if int(item.get("fails", 0)) >= lock_after and float(item.get("locked_until", 0)) <= now:
+            until = now + lock_secs
+            self._t().update_item(
+                Key={"configId": "authfail#" + usuario},
+                UpdateExpression="SET locked_until = :u, fails = :z, #ttl = :ttl",
+                ExpressionAttributeNames={"#ttl": "ttl"},
+                ExpressionAttributeValues={":u": until, ":z": 0, ":ttl": until + 60},
+            )
+            return float(until)
+        return float(item.get("locked_until", 0))
+
+    def auth_fail_locked_until(self, usuario: str) -> float:
+        item = self._t().get_item(Key={"configId": "authfail#" + usuario}).get("Item") or {}
+        return float(item.get("locked_until", 0))
+
+    def auth_fail_clear(self, usuario: str) -> None:
+        try:
+            self._t().delete_item(Key={"configId": "authfail#" + usuario})
+        except Exception:
+            pass
+
 
 class DynamoDbBroadcastStore:
     """Estados de los envíos (jobs): encolado→enviando→enviado/parcial, con progreso por canal.

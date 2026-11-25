@@ -467,14 +467,14 @@ class RoleTests(unittest.TestCase):
 
     def test_usuario_no_crea_usuarios_403(self):
         r = admin.lambda_handler(self._ev("POST", "/admin/api/users",
-                                          {"username": "x", "password": "abcdefgh", "role": "user"},
+                                          {"username": "x", "password": "Montana-Verde-27", "role": "user"},
                                           user="ana", pw="clave1234"), None)
         self.assertEqual(r["statusCode"], 403)
         self.assertNotIn("x", admin.config.users)
 
     def test_admin_crea_usuario_con_rol(self):
         r = admin.lambda_handler(self._ev("POST", "/admin/api/users",
-                                          {"username": "leo", "password": "abcdefgh", "role": "user"}), None)
+                                          {"username": "leo", "password": "Montana-Verde-27", "role": "user"}), None)
         self.assertEqual(r["statusCode"], 200)
         self.assertEqual(admin.config.users["leo"]["role"], "user")
 
@@ -969,15 +969,15 @@ class UsersUpdateTests(unittest.TestCase):
         self.assertIn("correo", admin.audit_store.entries[-1]["detail"])
 
     def test_restablece_la_contrasena_sin_pedir_la_actual(self):
-        r = admin.lambda_handler(self._ev({"username": "ana", "password": "otraclave99"}), None)
+        r = admin.lambda_handler(self._ev({"username": "ana", "password": "Rio-Magdalena-88"}), None)
         self.assertEqual(r["statusCode"], 200)
-        self.assertTrue(admin._verificar("ana", "otraclave99"))
+        self.assertTrue(admin._verificar("ana", "Rio-Magdalena-88"))
         self.assertFalse(admin._verificar("ana", "clave1234"))
         self.assertIn("contraseña", admin.audit_store.entries[-1]["detail"])
 
     def test_no_registra_la_contrasena_en_la_auditoria(self):
-        admin.lambda_handler(self._ev({"username": "ana", "password": "otraclave99"}), None)
-        self.assertNotIn("otraclave99", admin.audit_store.entries[-1]["detail"])
+        admin.lambda_handler(self._ev({"username": "ana", "password": "Rio-Magdalena-88"}), None)
+        self.assertNotIn("Rio-Magdalena-88", admin.audit_store.entries[-1]["detail"])
 
     def test_conserva_el_rol_y_los_datos_por_usuario(self):
         admin.config.users["ana"]["excluded"] = ["123"]
@@ -995,7 +995,7 @@ class UsersUpdateTests(unittest.TestCase):
         self.assertEqual(admin.lambda_handler(self._ev({"username": "ana"}), None)["statusCode"], 400)
 
     def test_un_usuario_normal_no_puede_editar_a_otros(self):
-        r = admin.lambda_handler(self._ev({"username": "ana", "password": "otraclave99"},
+        r = admin.lambda_handler(self._ev({"username": "ana", "password": "Rio-Magdalena-88"},
                                           user="ana", pw="clave1234"), None)
         self.assertEqual(r["statusCode"], 403)
         self.assertTrue(admin._verificar("ana", "clave1234"))
@@ -1685,3 +1685,106 @@ class PasswordRevealDomTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionCookieTests(unittest.TestCase):
+    """Ola 2 (SEC-05/08): sesión por cookie HttpOnly, CSRF, revocación y freno compartido."""
+
+    def setUp(self):
+        admin.config = FakeConfig()
+        admin.subscribers = FakeSubs()
+        admin.audit_store = FakeAudit()
+        os.environ["ADMIN_USER"] = "admin"
+        os.environ["ADMIN_PASSWORD"] = "secret123"
+        admin._auth_desbloquear()
+        admin._SESIONES_MEM.clear()
+        admin.config.users = {
+            "ana": {"email": "ana@x.com", "hash": admin.auth_dom.hash_password("Montana-Verde-27"), "role": "user"},
+        }
+
+    def tearDown(self):
+        admin.config = admin.subscribers = admin.audit_store = None
+        os.environ.pop("ADMIN_USER", None)
+        os.environ.pop("ADMIN_PASSWORD", None)
+
+    def _ev(self, method, path, body=None, cookie=None, extra=None):
+        h = {"host": "panel.example"}
+        if cookie:
+            h["cookie"] = f"otra=1; {admin._COOKIE}={cookie}"
+        h.update(extra or {})
+        return {"rawPath": f"/dev{path}", "requestContext": {"http": {"method": method, "path": f"/dev{path}"}},
+                "headers": h, "body": json.dumps(body) if body is not None else None}
+
+    def _login(self, user="ana", pw="Montana-Verde-27"):
+        r = admin.lambda_handler(self._ev("POST", "/admin/api/auth/login", {"username": user, "password": pw}), None)
+        return r, (r["headers"].get("Set-Cookie", "").split(";")[0].split("=", 1)[1] if r["statusCode"] == 200 else "")
+
+    def test_login_emite_cookie_endurecida_y_sirve_para_la_api(self):
+        r, sid = self._login()
+        self.assertEqual(r["statusCode"], 200)
+        ck = r["headers"]["Set-Cookie"]
+        for attr in ("__Host-", "HttpOnly", "Secure", "SameSite=Strict", "Path=/"):
+            self.assertIn(attr, ck)
+        me = admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=sid), None)
+        self.assertEqual(me["statusCode"], 200)
+        self.assertEqual(json.loads(me["body"])["user"], "ana")
+        # en el store solo queda el hash, nunca el id en claro
+        self.assertNotIn(sid, json.dumps(admin._SESIONES_MEM))
+
+    def test_login_malo_es_generico_y_cuenta_para_el_bloqueo(self):
+        for _ in range(admin._AUTH_MAX_FAILS):
+            r, _ = self._login(pw="mala")
+            self.assertEqual(r["statusCode"], 401)
+            self.assertNotIn("Set-Cookie", r["headers"])
+        r, _ = self._login()  # bloqueado aunque ahora acierte
+        self.assertEqual(r["statusCode"], 429)
+
+    def test_mutacion_con_cookie_exige_cabecera_csrf_y_mismo_origen(self):
+        _, sid = self._login()
+        body = {"source_channel": "x"}
+        sin = admin.lambda_handler(self._ev("POST", "/admin/api/config", body, cookie=sid), None)
+        self.assertEqual(sin["statusCode"], 401)
+        ajeno = admin.lambda_handler(self._ev("POST", "/admin/api/config", body, cookie=sid,
+                                              extra={"x-requested-with": "replica", "origin": "https://evil.example"}), None)
+        self.assertEqual(ajeno["statusCode"], 401)
+        ok = admin.lambda_handler(self._ev("POST", "/admin/api/config", body, cookie=sid,
+                                           extra={"x-requested-with": "replica", "origin": "https://panel.example"}), None)
+        self.assertEqual(ok["statusCode"], 200)
+
+    def test_logout_invalida_la_sesion_en_servidor(self):
+        _, sid = self._login()
+        out = admin.lambda_handler(self._ev("POST", "/admin/api/auth/logout", cookie=sid), None)
+        self.assertIn("Max-Age=0", out["headers"]["Set-Cookie"])
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=sid), None)["statusCode"], 401)
+
+    def test_cambiar_contrasena_revoca_las_otras_sesiones_y_reemite_la_propia(self):
+        _, otra = self._login()
+        _, mia = self._login()
+        r = admin.lambda_handler(self._ev("POST", "/admin/api/auth/change-password",
+                                          {"current": "Montana-Verde-27", "new": "Rio-Magdalena-88"}, cookie=mia,
+                                          extra={"x-requested-with": "replica"}), None)
+        self.assertEqual(r["statusCode"], 200, r["body"])
+        nueva = r["headers"]["Set-Cookie"].split(";")[0].split("=", 1)[1]
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=otra), None)["statusCode"], 401)
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=nueva), None)["statusCode"], 200)
+
+    def test_usuario_borrado_pierde_la_sesion(self):
+        _, sid = self._login()
+        del admin.config.users["ana"]
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=sid), None)["statusCode"], 401)
+
+    def test_sesion_caducada_no_vale(self):
+        _, sid = self._login()
+        for d in admin._SESIONES_MEM.values():
+            d["exp"] = int(time.time()) - 1
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", cookie=sid), None)["statusCode"], 401)
+
+    def test_freno_compartido_usa_el_store_si_existe(self):
+        llamadas = []
+        admin.config.auth_fail_incr = lambda u, n, s: llamadas.append(u) or 0.0
+        admin.config.auth_fail_locked_until = lambda u: time.time() + 60 if u == "ana" else 0.0
+        admin.config.auth_fail_clear = lambda u: None
+        r, _ = self._login()
+        self.assertEqual(r["statusCode"], 429)  # otro contenedor ya lo bloqueó
+        self._login(user="leo", pw="x")
+        self.assertIn("leo", llamadas)

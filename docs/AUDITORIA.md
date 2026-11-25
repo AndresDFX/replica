@@ -27,12 +27,12 @@ Leyenda de estado: ✅ corregido en este commit · 🟡 mitigado parcialmente ·
 | SEC-02 | Sin cabeceras de seguridad (clickjacking, sniffing, caché de PII) | Web — **Alta** | ✅ / 🟡 CSP |
 | SEC-03 | Rol `user` podía cambiar credenciales y **exfiltrar `whatsapp_token`** | Web/API — **Crítica** | ✅ |
 | SEC-04 | `telethon_api_hash` devuelto en claro por `/api/config` | API — Media | ✅ |
-| SEC-05 | Contraseña en `sessionStorage` (Basic Auth reenviado en cada petición) | Web — **Alta** | ⏳ Ola 2 |
+| SEC-05 | Basic Auth: la contraseña viaja en cada petición y no hay revocación de sesión | Web — **Alta** | ✅ Ola 2 |
 | SEC-06 | CSP requiere `'unsafe-inline'` (JS y handlers inline) | Web — Media | ⏳ Ola 3 |
 | SEC-07 | `bcEsc` no escapaba `'` ni `` ` ``; `data-id` sin escapar | Web — Media | ✅ |
-| SEC-08 | Freno de intentos en memoria por contenedor (eludible con concurrencia) | API — Media | ⏳ Ola 2 |
+| SEC-08 | Freno de intentos en memoria por contenedor (eludible con concurrencia) | API — Media | ✅ Ola 2 |
 | SEC-09 | Sin MFA para el panel, que gobierna dos cuentas personales | Web — Alta | ⏳ Ola 3 |
-| SEC-10 | Política de contraseña mínima (8 caracteres, sin lista de filtradas) | Web — Baja | ⏳ Ola 2 |
+| SEC-10 | Política de contraseña mínima (8 caracteres, sin lista de filtradas) | Web — Baja | ✅ Ola 2 |
 | SEC-11 | Envío masivo a contactos sin registro de consentimiento/opt-out | Legal — Alta | ⏳ Ola 3 |
 
 **SEC-01: bloqueo global.**
@@ -60,10 +60,11 @@ Leyenda de estado: ✅ corregido en este commit · 🟡 mitigado parcialmente ·
   `api_hash`. Junto con `api_id`, es credencial de aplicación de Telegram.
 
 **SEC-05: credencial reutilizable en el cliente.**
-- **Diagnóstico:** el panel guarda `base64(usuario:contraseña)` en `sessionStorage` y lo manda
-  como `Authorization: Basic` en cada petición.
-- **Vector:** cualquier XSS, extensión maliciosa o equipo compartido obtiene la **contraseña**, no
-  un token revocable. El logout no invalida nada en el servidor.
+- **Diagnóstico** (corregido tras revisar el código): desde M17 la credencial ya vivía **solo en
+  memoria**, no en `sessionStorage`. Aun así, `base64(usuario:contraseña)` viajaba como
+  `Authorization: Basic` en cada petición.
+- **Vector:** un XSS o una extensión maliciosa obtiene la **contraseña**, no un token revocable.
+  El logout no invalidaba nada en el servidor, y recargar la página obligaba a volver a entrar.
 
 **SEC-06: CSP con `'unsafe-inline'`.**
 - **Diagnóstico:** el shell tiene unos 160 KB de JS inline y `onclick=` por todas partes, así que
@@ -100,8 +101,8 @@ Leyenda de estado: ✅ corregido en este commit · 🟡 mitigado parcialmente ·
 
 | ID | Hallazgo | Severidad | Estado |
 |---|---|---|---|
-| UX-01 | Un `user` ve Ajustes → Conexiones/credenciales que ya no puede guardar (recibe un 403 con mensaje) | Media | ⏳ Ola 2 |
-| UX-02 | Quedan 2 `confirm()` nativos (fuera del design system, sin foco gestionado ni microcopy de consecuencia) | Media | ⏳ Ola 2 |
+| UX-01 | Un `user` ve Ajustes → Conexiones/credenciales que ya no puede guardar (recibe un 403 con mensaje) | Media | ✅ Ola 2 |
+| UX-02 | ~~Quedan 2 `confirm()` nativos~~ **Falso positivo**: las dos coincidencias eran comentarios; todo usa `dsModal` | — | ✔ sin acción |
 | UX-03 | Contraseñas nuevas sin `autocomplete="new-password"`, por lo que el gestor no ofrece generar ni guardar | Baja | ✅ |
 | A11Y-01 | Campos de secretos sin `autocomplete="off"`, así que el navegador los guardaba en su historial | Baja | ✅ |
 | A11Y-02 | `minlength` ausente: la política no se anuncia ni se valida antes del envío | Baja | ✅ (nativo) / ⏳ medidor en vivo |
@@ -157,7 +158,42 @@ Puntos ya correctos, verificados en el código:
 
 Resultado de la suite: **441 passed**.
 
-### Ola 2 — Sprint 1
+### Ola 2 — aplicada (2026-11-25)
+
+Resumen de lo implementado (los detalles de diseño siguen abajo):
+
+- **SEC-05:**
+  - `POST /api/auth/login` emite `__Host-replica_sid` (HttpOnly, Secure, SameSite=Strict, 8 h) y
+    guarda en DynamoDB solo `sha256(sid)` en `configId = sess#<hash>`.
+  - `POST /api/auth/logout` la borra en el servidor.
+  - Revocación por `sv` (versión de sesiones del usuario): cambiar o restablecer la contraseña y
+    borrar al usuario invalidan sus sesiones. La sesión propia se reemite al cambiar la contraseña.
+  - CSRF: `X-Requested-With: replica` obligatorio en las mutaciones con cookie, más `Origin`
+    igual al host.
+  - El front ya no maneja la contraseña tras el login, y recargar la página conserva la sesión.
+  - Basic Auth sigue aceptado solo para scripts y smoke tests.
+- **SEC-08:**
+  - Contador atómico `authfail#<user>` (`UpdateItem ADD`) compartido entre contenedores, más el
+    respaldo en memoria.
+  - `ConfigTable` gana `TimeToLiveSpecification` en `ttl`.
+  - El throttle de API Gateway (20 rps, ráfaga de 40) ya existía.
+- **SEC-10:** mínimo 12 caracteres, lista local de contraseñas comunes (no se envía nada a
+  terceros), ≥ 5 caracteres distintos y no puede contener el usuario. Mensajes concretos en la UI.
+  HIBP queda como opción si se acepta la llamada externa.
+- **UX-01:** las tarjetas `data-solo-admin` (conexiones de Telegram y WhatsApp y correo de
+  recuperación) se ven en solo lectura para un `user`, con el aviso
+  *«🔒 Solo un administrador puede cambiar estas conexiones y credenciales.»*
+- **Login:**
+  - bloqueo de doble envío (`aria-busy`) y validación de campos vacíos;
+  - la contraseña se limpia tras el intento;
+  - el foco vuelve al campo de contraseña si falla.
+- **Pruebas:** 8 nuevas en `SessionCookieTests`. Suite completa: **449 passed**.
+
+**Despliegue:** requiere actualizar la pila de CloudFormation (el TTL de la tabla de
+configuración) y la Lambda `admin`. Las sesiones abiertas con Basic Auth tendrán que volver a
+iniciar sesión una vez.
+
+Diseño de referencia (original del plan):
 
 **SEC-05: sesión con cookie.** Reemplazar Basic Auth por una sesión:
 

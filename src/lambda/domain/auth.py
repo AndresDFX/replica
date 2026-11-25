@@ -14,12 +14,35 @@ import secrets
 
 _ALGO = "pbkdf2_sha256"
 _ITERS = 200_000
-_MIN_LEN = 8
+_MIN_LEN = 12  # SEC-10 (ASVS 2.1.1): 12+; antes 8
+
+# Lista corta de contraseñas/raíces más filtradas (se compara normalizada y sin dígitos finales).
+# Local a propósito: no enviar nada de la contraseña a terceros.
+_COMUNES = frozenset("""
+password contrasena contraseña qwerty qwertyuiop asdfghjkl zxcvbnm abc123 abcdef 123456789 1234567890
+iloveyou admin administrador welcome bienvenido letmein monkey dragon football futbol colombia
+replica telegram whatsapp passw0rd p@ssw0rd changeme cambiame secreto
+""".split())
 
 
-def password_valida(password: str) -> bool:
-    """Política mínima: al menos 8 caracteres."""
-    return isinstance(password, str) and len(password) >= _MIN_LEN
+def motivo_password(password: str, usuario: str = "") -> str:
+    """Por qué la contraseña NO cumple la política ("" si cumple). Mensajes listos para la UI."""
+    if not isinstance(password, str) or len(password) < _MIN_LEN:
+        return f"La contraseña debe tener al menos {_MIN_LEN} caracteres."
+    base = password.lower().rstrip("0123456789!.*#@$ ")
+    if base in _COMUNES or password.lower() in _COMUNES:
+        return "Esa contraseña es de las más usadas y filtradas; elige otra."
+    if len(set(password)) < 5:
+        return "La contraseña repite demasiado los mismos caracteres; elige otra."
+    u = (usuario or "").strip().lower()
+    if len(u) >= 3 and u in password.lower():
+        return "La contraseña no puede contener tu nombre de usuario."
+    return ""
+
+
+def password_valida(password: str, usuario: str = "") -> bool:
+    """Política: 12+ caracteres, no común, no trivial, sin el usuario dentro."""
+    return motivo_password(password, usuario) == ""
 
 
 def hash_password(password: str, iterations: int = _ITERS) -> str:

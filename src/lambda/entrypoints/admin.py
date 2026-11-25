@@ -188,8 +188,17 @@ def _planes_con_progreso() -> list[dict]:
 
 # --- auth -------------------------------------------------------------------
 
+def _norm(usuario: str) -> str:
+    return (usuario or "").strip().lower()[:128]
+
+
+def _store_auth(nombre: str):
+    """Método del ConfigStore para el freno/sesiones compartidos (SEC-05/08), o None."""
+    return getattr(config, nombre, None) if config is not None else None
+
+
 def _auth_estado(usuario: str) -> dict[str, float]:
-    k = (usuario or "").strip().lower()[:128]
+    k = _norm(usuario)
     st = _AUTH.get(k)
     if st is None:
         if len(_AUTH) >= _AUTH_MAX_ENTRADAS:
@@ -199,27 +208,43 @@ def _auth_estado(usuario: str) -> dict[str, float]:
 
 
 def _auth_desbloquear(usuario: str | None = None) -> None:
-    """Limpia el freno de un usuario (o de todos si es None)."""
+    """Limpia el freno de un usuario (o de todos los de memoria si es None)."""
     if usuario is None:
         _AUTH.clear()
-    else:
-        _AUTH.pop((usuario or "").strip().lower()[:128], None)
+        return
+    _AUTH.pop(_norm(usuario), None)
+    f = _store_auth("auth_fail_clear")
+    if f:
+        try:
+            f(_norm(usuario))
+        except Exception:
+            logger.warning("auth_fail_clear falló", exc_info=True)
+
+
+def _auth_locked_until(usuario: str) -> float:
+    st = _AUTH.get(_norm(usuario)) or {"locked_until": 0.0}
+    until = float(st["locked_until"])
+    f = _store_auth("auth_fail_locked_until")
+    if f:
+        try:
+            until = max(until, float(f(_norm(usuario))))
+        except Exception:
+            logger.warning("auth_fail_locked_until falló", exc_info=True)
+    return until
 
 
 def _auth_bloqueado(usuario: str) -> bool:
-    st = _AUTH.get((usuario or "").strip().lower()[:128])
-    return bool(st and st["locked_until"] > time.time())
+    return _auth_locked_until(usuario) > time.time()
 
 
 def _auth_segundos(usuario: str) -> int:
-    st = _AUTH.get((usuario or "").strip().lower()[:128]) or {"locked_until": 0.0}
-    return max(1, int(st["locked_until"] - time.time()))
+    return max(1, int(_auth_locked_until(usuario) - time.time()))
 
 
 def _auth_fallo(usuario: str) -> None:
-    # M16: NO dormir el handler (bloquea el worker Lambda y se factura). El freno real es el
-    # lock 'locked_until' (devuelve 429 sin procesar) + el throttling de API Gateway.
-    # M26: si el cooldown anterior YA expiró, reiniciar el contador.
+    # M16: NO dormir el handler. SEC-08: además del contador en memoria (por contenedor), si el
+    # store lo soporta se suma ATÓMICAMENTE en DynamoDB: varios contenedores en paralelo ya no
+    # multiplican los intentos permitidos.
     st = _auth_estado(usuario)
     if st["locked_until"] and st["locked_until"] <= time.time():
         st["fails"] = 0
@@ -227,9 +252,134 @@ def _auth_fallo(usuario: str) -> None:
     st["fails"] += 1
     if st["fails"] >= _AUTH_MAX_FAILS:
         st["locked_until"] = time.time() + _AUTH_LOCK_SECS
+    f = _store_auth("auth_fail_incr")
+    if f:
+        try:
+            f(_norm(usuario), _AUTH_MAX_FAILS, _AUTH_LOCK_SECS)
+        except Exception:
+            logger.warning("auth_fail_incr falló", exc_info=True)
+
+
+# --- sesión por cookie (SEC-05) ---------------------------------------------------------------
+# El panel ya NO reenvía la contraseña en cada petición: el login crea un id aleatorio que viaja
+# solo en una cookie __Host- HttpOnly + Secure + SameSite=Strict; en DynamoDB se guarda su sha256.
+# La sesión muere por: logout, caducidad (8 h), cambio/reseteo de contraseña o borrado del usuario
+# (campo 'sv' = versión de sesiones del usuario). Basic Auth se sigue aceptando para scripts/smoke.
+_COOKIE = "__Host-replica_sid"
+_SESSION_SECS = 8 * 3600
+_SESIONES_MEM: dict[str, dict] = {}  # fallback si el store no soporta sesiones (tests/local)
+
+
+def _sid_hash(sid: str) -> str:
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()
+
+
+def _cookie_sid(event: dict[str, Any]) -> str:
+    crudas = list(event.get("cookies") or [])  # HTTP API v2 entrega las cookies aquí
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    if headers.get("cookie"):
+        crudas += str(headers["cookie"]).split(";")
+    for c in crudas:
+        nombre, _, valor = str(c).strip().partition("=")
+        if nombre == _COOKIE and valor:
+            return valor.strip()[:256]
+    return ""
+
+
+def _sv(usuario: str) -> int:
+    try:
+        return int(((config.get_users() or {}).get(usuario) or {}).get("sv", 0))
+    except Exception:
+        return 0
+
+
+def _existe_usuario(usuario: str) -> bool:
+    try:
+        if usuario in (config.get_users() or {}):
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get("ADMIN_PASSWORD")) and usuario == admin_user()
+
+
+def _sesion(event: dict[str, Any]) -> dict | None:
+    if "_sesion" in event:
+        return event["_sesion"]
+    ses = None
+    sid = _cookie_sid(event)
+    if sid:
+        h = _sid_hash(sid)
+        try:
+            getter = _store_auth("get_session")
+            datos = getter(h) if getter else _SESIONES_MEM.get(h, {})
+        except Exception:
+            logger.warning("get_session falló", exc_info=True)
+            datos = {}
+        u = str((datos or {}).get("user", ""))
+        if (u and float(datos.get("exp", 0)) > time.time() and int(datos.get("sv", 0)) == _sv(u)
+                and _existe_usuario(u)):
+            ses = {"user": u, "hash": h}
+    event["_sesion"] = ses
+    return ses
+
+
+def _crear_sesion(usuario: str) -> str:
+    import secrets as _secrets
+    sid = _secrets.token_urlsafe(32)
+    datos = {"user": usuario, "exp": int(time.time()) + _SESSION_SECS, "sv": _sv(usuario),
+             "created_at": int(time.time())}
+    putter = _store_auth("put_session")
+    if putter:
+        putter(_sid_hash(sid), datos)
+    else:
+        _SESIONES_MEM[_sid_hash(sid)] = datos
+    return sid
+
+
+def _borrar_sesion(event: dict[str, Any]) -> None:
+    sid = _cookie_sid(event)
+    if not sid:
+        return
+    h = _sid_hash(sid)
+    f = _store_auth("delete_session")
+    try:
+        if f:
+            f(h)
+        else:
+            _SESIONES_MEM.pop(h, None)
+    except Exception:
+        logger.warning("delete_session falló", exc_info=True)
+
+
+def _set_cookie(sid: str, max_age: int) -> str:
+    return f"{_COOKIE}={sid}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+
+
+def _revocar_sesiones(rec: dict) -> dict:
+    """Sube la versión de sesiones del usuario: todas sus sesiones abiertas dejan de valer."""
+    rec["sv"] = int(rec.get("sv", 0)) + 1
+    return rec
+
+
+def _csrf_ok(event: dict[str, Any], method: str) -> bool:
+    """Mutaciones con cookie: exigir la cabecera propia (fuerza preflight CORS, que no se concede)
+    y, si llega Origin, que sea el mismo host. SameSite=Strict ya es la primera barrera."""
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return True
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    if headers.get("x-requested-with", "") != "replica":
+        return False
+    origin = str(headers.get("origin", ""))
+    if origin:
+        host = str(headers.get("host", ""))
+        return bool(host) and origin.split("://", 1)[-1].rstrip("/") == host
+    return True
 
 
 def _autorizado(event: dict[str, Any]) -> bool:
+    if _sesion(event):
+        method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+        return _csrf_ok(event, method)
     usuario = _usuario_actual(event)
     if _auth_bloqueado(usuario):
         return False  # en cooldown tras demasiados intentos fallidos
@@ -250,6 +400,30 @@ def _autorizado(event: dict[str, Any]) -> bool:
     return ok
 
 
+def _auth_login(event: dict[str, Any]) -> dict[str, Any]:
+    c = _body(event)
+    usuario = str(c.get("username", "")).strip()[:128]
+    clave = str(c.get("password", ""))
+    if _auth_bloqueado(usuario):
+        mins = max(1, (_auth_segundos(usuario) + 59) // 60)
+        return _json({"error": f"Demasiados intentos. Espera ~{mins} min."}, 429)
+    if not usuario or not _verificar(usuario, clave):
+        _auth_fallo(usuario)
+        return _json({"error": "Usuario o contraseña incorrectos."}, 401)
+    _auth_desbloquear(usuario)
+    sid = _crear_sesion(usuario)
+    r = _json({"ok": True, "user": usuario})
+    r["headers"]["Set-Cookie"] = _set_cookie(sid, _SESSION_SECS)
+    return r
+
+
+def _auth_logout(event: dict[str, Any]) -> dict[str, Any]:
+    _borrar_sesion(event)
+    r = _json({"ok": True})
+    r["headers"]["Set-Cookie"] = _set_cookie("", 0)
+    return r
+
+
 def _verificar(usuario: str, clave: str) -> bool:
     """Valida contra los usuarios del panel (hash PBKDF2) y, como bootstrap, contra el usuario
     de entorno (ADMIN_USER/ADMIN_PASSWORD): así nunca se queda uno bloqueado del panel."""
@@ -264,6 +438,9 @@ def _verificar(usuario: str, clave: str) -> bool:
 
 
 def _usuario_actual(event: dict[str, Any]) -> str:
+    ses = _sesion(event)
+    if ses:
+        return ses["user"]
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
     auth = headers.get("authorization", "")
     if not auth.startswith("Basic "):
@@ -392,8 +569,8 @@ def _auth_reset(body: dict) -> dict[str, Any]:
     usuario = str(body.get("username", "")).strip()
     code = str(body.get("code", "")).strip()
     nueva = body.get("new") or ""
-    if not auth_dom.password_valida(nueva):
-        return _json({"error": "La nueva contraseña debe tener al menos 8 caracteres."}, 400)
+    if auth_dom.motivo_password(nueva, usuario):
+        return _json({"error": auth_dom.motivo_password(nueva, usuario)}, 400)
     resets = config.get_resets() or {}
     r = resets.get(usuario)
     if not r:
@@ -410,6 +587,7 @@ def _auth_reset(body: dict) -> dict[str, Any]:
     users = config.get_users() or {}
     u = users.get(usuario) or {"email": "", "created_at": int(time.time())}
     u["hash"] = auth_dom.hash_password(nueva)
+    _revocar_sesiones(u)
     users[usuario] = u; config.set_users(users)
     resets.pop(usuario, None); config.set_resets(resets)
     _audit("users:reset-clave", usuario)
@@ -881,6 +1059,10 @@ def _dispatch(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # Recuperación de contraseña: rutas PÚBLICAS (sin sesión). El reseteo tiene tope de
     # intentos + caducidad; forgot responde genérico (no revela si el usuario existe).
+    if sub == "/api/auth/login" and method == "POST":
+        return _auth_login(event)
+    if sub == "/api/auth/logout" and method == "POST":
+        return _auth_logout(event)
     if sub == "/api/auth/forgot" and method == "POST":
         return _auth_forgot(_body(event))
     if sub == "/api/auth/reset" and method == "POST":
@@ -923,8 +1105,8 @@ def _dispatch(event: dict[str, Any], context: Any) -> dict[str, Any]:
             rol = "admin" if str(c.get("role", "user")) == "admin" else "user"
             if not username:
                 return _json({"error": "El usuario es obligatorio."}, 400)
-            if not auth_dom.password_valida(pw):
-                return _json({"error": "La contraseña debe tener al menos 8 caracteres."}, 400)
+            if auth_dom.motivo_password(pw, username):
+                return _json({"error": auth_dom.motivo_password(pw, username)}, 400)
             users = config.get_users() or {}
             if username in users:
                 return _json({"error": "Ya existe un usuario con ese nombre."}, 400)
@@ -951,9 +1133,10 @@ def _dispatch(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 tocados.append("correo")
             pw_nueva = c.get("password") or ""
             if pw_nueva:
-                if not auth_dom.password_valida(pw_nueva):
-                    return _json({"error": "La contraseña debe tener al menos 8 caracteres."}, 400)
+                if auth_dom.motivo_password(pw_nueva, username):
+                    return _json({"error": auth_dom.motivo_password(pw_nueva, username)}, 400)
                 rec["hash"] = auth_dom.hash_password(pw_nueva)
+                _revocar_sesiones(rec)
                 tocados.append("contraseña")
             if not tocados:
                 return _json({"error": "No hay cambios: escribe un correo o una contraseña nueva."}, 400)
@@ -1013,17 +1196,21 @@ def _dispatch(event: dict[str, Any], context: Any) -> dict[str, Any]:
             c = _body(event)
             me = _usuario_actual(event)
             nueva = c.get("new") or ""
-            if not auth_dom.password_valida(nueva):
-                return _json({"error": "La nueva contraseña debe tener al menos 8 caracteres."}, 400)
+            if auth_dom.motivo_password(nueva, me):
+                return _json({"error": auth_dom.motivo_password(nueva, me)}, 400)
             if not _verificar(me, c.get("current") or ""):
                 return _json({"error": "La contraseña actual es incorrecta."}, 400)
             users = config.get_users() or {}
             u = users.get(me) or {"email": "", "created_at": int(time.time())}
             u["hash"] = auth_dom.hash_password(nueva)
+            _revocar_sesiones(u)  # cierra las DEMÁS sesiones (otro equipo, el móvil...)
             users[me] = u
             config.set_users(users)
             _audit("users:cambiar-clave", me)
-            return _json({"ok": True})
+            r = _json({"ok": True})
+            if _sesion(event):  # la sesión actual se reemite para no echar a quien la cambió
+                r["headers"]["Set-Cookie"] = _set_cookie(_crear_sesion(me), _SESSION_SECS)
+            return r
         if sub == "/api/config" and method == "GET":
             return _json(_config_publico())
         if sub == "/api/config" and method == "POST":
@@ -2510,14 +2697,14 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
   <label>Usuario</label><input id="lu" autocomplete="username" placeholder="usuario o correo">
   <label>Contraseña</label><input id="lp" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()">
   <div class="err" id="lerr" role="alert" aria-live="assertive"></div>
-  <button style="width:100%;margin-top:8px" onclick="doLogin()">Entrar</button>
+  <button id="login_btn" style="width:100%;margin-top:8px" onclick="doLogin()">Entrar</button>
   <div style="text-align:center;margin-top:12px"><a href="#" onclick="fpToggle();return false" style="color:var(--ac);font-size:13px;text-decoration:none">¿Olvidaste tu contraseña?</a></div>
   <div id="fp_box" style="display:none;margin-top:14px;border-top:1px solid var(--bd);padding-top:14px">
     <label>Usuario o correo</label><input id="fp_user" placeholder="tu usuario">
     <button class="sec" style="width:100%;margin-top:8px" onclick="fpSend()">Enviar código</button>
     <div id="fp_step2" style="display:none;margin-top:10px">
       <label>Código (te llega por correo)</label><input id="fp_code" inputmode="numeric" placeholder="123456">
-      <label>Nueva contraseña (mínimo 8)</label><input id="fp_new" type="password" autocomplete="new-password" minlength="8">
+      <label>Nueva contraseña (mínimo 12)</label><input id="fp_new" type="password" autocomplete="new-password" minlength="12">
       <button style="width:100%;margin-top:8px" onclick="fpReset()">Restablecer contraseña</button>
     </div>
     <div class="hint" id="fp_status" style="margin-top:8px"></div>
@@ -2594,7 +2781,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
   </div>
   <div class="card" data-tab="fuentes" style="padding:14px 18px"><div class="subnav" data-subnav="fuentes"><span class="hint" style="margin:0 8px 0 0">Ver:</span><button data-sub="tg" onclick="showSub('fuentes','tg')"><svg class="ico"><use href="#i-tg"></use></svg> Telegram</button><button data-sub="wa" onclick="showSub('fuentes','wa')"><svg class="ico"><use href="#i-wa"></use></svg> WhatsApp</button></div></div>
   <div class="card" data-tab="ajustes" style="padding:14px 18px"><div class="subnav" data-subnav="ajustes"><span class="hint" style="margin:0 8px 0 0">Ver:</span><button data-sub="conexiones" onclick="showSub('ajustes','conexiones')">🔌 Conexiones</button><button data-sub="captura" onclick="showSub('ajustes','captura')">📥 Captura</button><button data-sub="envio" onclick="showSub('ajustes','envio')">📤 Ritmo y horarios</button><button data-sub="acceso" onclick="showSub('ajustes','acceso')">👤 Acceso</button><button data-sub="sistema" onclick="showSub('ajustes','sistema')">🛠️ Auditoría</button></div></div>
-  <div class="card accent" data-tab="ajustes" data-sub="conexiones"><h2><svg class="ico"><use href="#i-tg"></use></svg> Cuenta de Telegram<span class="help" tabindex="0" data-tip="Dos modos: Bot (envía a quienes te dan /start) o Userbot (envía desde TU cuenta a tus contactos, vía Telethon). El userbot llega a más gente pero tiene más riesgo de baneo.">ⓘ</span></h2>
+  <div class="card accent" data-tab="ajustes" data-sub="conexiones" data-solo-admin><h2><svg class="ico"><use href="#i-tg"></use></svg> Cuenta de Telegram<span class="help" tabindex="0" data-tip="Dos modos: Bot (envía a quienes te dan /start) o Userbot (envía desde TU cuenta a tus contactos, vía Telethon). El userbot llega a más gente pero tiene más riesgo de baneo.">ⓘ</span></h2>
    <label>Modo de envío</label>
    <select id="send_mode"><option value="bot">Bot — a suscriptores que dan /start</option><option value="userbot">Mi cuenta personal — a mis contactos</option></select>
 
@@ -2642,7 +2829,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
      <span id="tl_logout_out" class="hint" style="margin-top:0"></span>
    </div>
   </div>
-  <div class="card" data-tab="ajustes" data-sub="conexiones"><h2><svg class="ico"><use href="#i-wa"></use></svg> WhatsApp (reenvío)<span class="help" tabindex="0" data-tip="Conecta el servicio de WhatsApp (URL + token, QR o código) y decide si cada lista capturada también se reenvía por WhatsApp. Vincula desde tu IP residencial.">ⓘ</span></h2>
+  <div class="card" data-tab="ajustes" data-sub="conexiones" data-solo-admin><h2><svg class="ico"><use href="#i-wa"></use></svg> WhatsApp (reenvío)<span class="help" tabindex="0" data-tip="Conecta el servicio de WhatsApp (URL + token, QR o código) y decide si cada lista capturada también se reenvía por WhatsApp. Vincula desde tu IP residencial.">ⓘ</span></h2>
    <label style="display:flex;align-items:center;gap:8px;margin-top:0"><input type="checkbox" id="whatsapp_enabled" style="width:auto"> Reenviar también cada lista por WhatsApp</label>
    <label>URL del servicio WhatsApp</label><input id="whatsapp_service_url" placeholder="https://...onrender.com">
    <label>Token del servicio <span id="wa_tok_status" class="hint"></span></label>
@@ -2979,13 +3166,13 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
      <div><label>Correo (para recuperación)</label><input id="usr_new_email" placeholder="correo@dominio.com"></div>
    </div>
    <div class="row">
-     <div><label>Contraseña (mínimo 8)</label><input id="usr_new_pw" type="password" autocomplete="new-password" minlength="8"></div>
+     <div><label>Contraseña (mínimo 12)</label><input id="usr_new_pw" type="password" autocomplete="new-password" minlength="12"></div>
      <div><label>Rol<span class="help" tabindex="0" data-tip="Administrador: gestiona usuarios y todo lo demás. Usuario: hace todo MENOS gestionar usuarios.">ⓘ</span></label>
        <select id="usr_new_role"><option value="user" selected>Usuario (sin gestión de usuarios)</option><option value="admin">Administrador</option></select></div>
    </div>
    <button style="margin-top:10px" onclick="createUser()">Crear usuario</button>
   </div>
-  <div class="card" data-tab="ajustes" data-sub="acceso"><h2>✉️ Correo de recuperación<span class="help" tabindex="0" data-tip="Servicio gratis (Resend, 100/día) para enviar el código de «¿Olvidaste tu contraseña?». Sin API key, el código se intenta enviar por el correo de alertas de AWS (SNS).">ⓘ</span> <span id="mail_status" class="hint"></span></h2>
+  <div class="card" data-tab="ajustes" data-sub="acceso" data-solo-admin><h2>✉️ Correo de recuperación<span class="help" tabindex="0" data-tip="Servicio gratis (Resend, 100/día) para enviar el código de «¿Olvidaste tu contraseña?». Sin API key, el código se intenta enviar por el correo de alertas de AWS (SNS).">ⓘ</span> <span id="mail_status" class="hint"></span></h2>
    <div class="hint">Servicio gratis para entregar el código cuando alguien usa «¿Olvidaste tu contraseña?». Crea una cuenta en <b>resend.com</b> (100 correos/día gratis), genera una API key y pégala aquí. Sin esto, el código se intenta enviar por el correo de alertas de AWS (SNS).</div>
    <label>Remitente</label>
    <input id="mail_from" placeholder="Replica &lt;onboarding@resend.dev&gt;">
@@ -2996,7 +3183,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
   </div>
   <div class="card" data-tab="ajustes" data-sub="acceso"><h2>🔑 Cambiar mi contraseña</h2>
    <label>Contraseña actual</label><input id="cp_cur" type="password" autocomplete="current-password">
-   <label>Nueva contraseña (mínimo 8)</label><input id="cp_new" type="password" autocomplete="new-password" minlength="8">
+   <label>Nueva contraseña (mínimo 12)</label><input id="cp_new" type="password" autocomplete="new-password" minlength="12">
    <div style="margin-top:10px"><button onclick="changePassword()">Cambiar contraseña</button> <span id="cp_status" class="hint" style="margin-left:10px"></span></div>
   </div>
   <div class="card accent" data-tab="ajustes" data-sub="envio"><h2>Anti-baneo · ritmo de envío<span class="help" tabindex="0" data-tip="Cuántos mensajes por grupo (máx 150) y pausas ALEATORIAS entre mensajes para no parecer spam y reducir el riesgo de baneo. «Poco a poco» = un grupo a la vez.">ⓘ</span></h2>
@@ -3067,8 +3254,10 @@ const $ = id => document.getElementById(id);
 // en diálogos de texto plano (confirmModal/alert/toast) se mantienen los emojis ✈️/🟢.
 const ICO_TG = '<svg class="ico"><use href="#i-tg"></use></svg>';
 const ICO_WA = '<svg class="ico"><use href="#i-wa"></use></svg>';
-let CRED = '';  // M17: la credencial vive SOLO en memoria (no se persiste). Recargar => re-login.
-function hdr(extra){ return Object.assign({Authorization:'Basic '+CRED}, extra||{}); }
+// SEC-05: la sesión vive en una cookie HttpOnly (el JS no puede leerla). CRED es solo la bandera
+// "hay sesión" que usan los sondeos; la contraseña ya no se guarda ni se reenvía.
+let CRED = '';
+function hdr(extra){ return Object.assign({'X-Requested-With':'replica'}, extra||{}); }
 async function api(p, opt){ opt=opt||{}; opt.headers=hdr(opt.headers); const r=await fetch(BASE+p,opt);
   if(r.status===401){ logout(); throw new Error('401'); }
   if(!r.ok){ let _m=''; try{ _m=(await r.json()).error||''; }catch(e){} throw new Error(_m||('error '+r.status)); }
@@ -3145,13 +3334,20 @@ function gvPager(key,total,pages){ const g=GV[key]; const el=g&&g.pagerId&&$(g.p
     +'<button class="ghost gv-nav" '+(g.page>=pages-1?'disabled':'')+' onclick="gvPage(\''+key+'\',1)" aria-label="Siguiente">›</button>';
 }
 function gvPage(key,d){ const g=GV[key]; if(!g) return; g.page=Math.max(0,g.page+d); gvRender(key); }
-async function doLogin(){ const u=$('lu').value, p=$('lp').value; CRED=btoa(u+':'+p);
-  try{ const r=await fetch(BASE+'/api/me',{headers:hdr()});
+let LOGIN_BUSY=false;
+async function doLogin(){ if(LOGIN_BUSY) return; const u=$('lu').value.trim(), p=$('lp').value;
+  if(!u||!p){ $('lerr').textContent='Escribe tu usuario y tu contraseña.'; ($('lu').value?$('lp'):$('lu')).focus(); return; }
+  LOGIN_BUSY=true; const btn=$('login_btn'); if(btn){ btn.disabled=true; btn.setAttribute('aria-busy','true'); }
+  $('lerr').textContent='';
+  try{ const r=await fetch(BASE+'/api/auth/login',{method:'POST',headers:hdr({'Content-Type':'application/json'}),body:JSON.stringify({username:u,password:p})});
     if(!r.ok){ const j=await r.json().catch(()=>({})); const er=new Error(j.error||''); er.status=r.status; throw er; }
-    $('login').style.display='none'; $('app').style.display='block'; $('who').textContent=u; boot(); }
-  catch(e){ CRED='';
-    $('lerr').textContent = (e&&e.status===429&&e.message) ? e.message : 'Usuario o contraseña incorrectos (tras varios intentos se bloquea unos minutos)'; } }
-function logout(){ sessionStorage.removeItem('cred'); CRED='';
+    CRED='1'; $('lp').value=''; $('login').style.display='none'; $('app').style.display='block'; $('who').textContent=u; boot(); }
+  catch(e){ CRED=''; $('lp').value=''; $('lp').focus();
+    $('lerr').textContent = (e&&e.status===429&&e.message) ? e.message : 'Usuario o contraseña incorrectos (tras varios intentos se bloquea unos minutos)'; }
+  finally{ LOGIN_BUSY=false; const btn=$('login_btn'); if(btn){ btn.disabled=false; btn.removeAttribute('aria-busy'); } } }
+function logout(){ try{ sessionStorage.removeItem('cred'); sessionStorage.removeItem('cred_ts'); }catch(e){}
+  if(CRED){ try{ fetch(BASE+'/api/auth/logout',{method:'POST',headers:hdr(),keepalive:true}); }catch(e){} }
+  CRED='';
   // M39: detener TODOS los polls (si no, CONN_TIMER y otros siguen vivos tras salir).
   try{ [BC_TIMER,Q_TIMER,PL_TIMER,CONN_TIMER].forEach(t=>{ if(t) clearInterval(t); }); BC_TIMER=Q_TIMER=PL_TIMER=CONN_TIMER=null; }catch(e){}
   // Vaciar el acceso: volver a tapar el campo esconde el estado, no quita el secreto. El valor
@@ -3189,12 +3385,28 @@ async function fpReset(){
 // USR_PRINCIPAL: el admin del bootstrap (ADMIN_USER). Lo dice el backend en /api/users, no se
 // adivina: es quien no se puede borrar ni degradar, y su nombre no siempre es "admin".
 let USR_ME='', IS_ADMIN=false, USR_PRINCIPAL='admin';
+// UX-01: las tarjetas con credenciales/conexiones (data-solo-admin) quedan en SOLO LECTURA para un
+// usuario normal: se ven el estado y los indicadores, pero no hay controles que acabarían en 403.
+function aplicarSoloAdmin(){
+  document.querySelectorAll('[data-solo-admin]').forEach(card=>{
+    card.querySelectorAll('input,select,textarea,button:not(.help):not(.pw-ojo)').forEach(el=>{
+      if(!IS_ADMIN){ if(!el.hasAttribute('data-lock')){ el.setAttribute('data-lock', el.disabled?'1':'0'); } el.disabled=true; el.setAttribute('aria-disabled','true'); }
+      else if(el.hasAttribute('data-lock')){ el.disabled = el.getAttribute('data-lock')==='1'; el.removeAttribute('data-lock'); el.removeAttribute('aria-disabled'); }
+    });
+    let n=card.querySelector('.solo-admin-aviso');
+    if(!IS_ADMIN && !n){ n=document.createElement('div'); n.className='hint solo-admin-aviso'; n.setAttribute('role','note');
+      n.textContent='🔒 Solo un administrador puede cambiar estas conexiones y credenciales. Pídeselo a un administrador.';
+      const h=card.querySelector('h2'); if(h) h.insertAdjacentElement('afterend', n); else card.prepend(n); }
+    if(IS_ADMIN && n) n.remove();
+  });
+}
 // Carga quién soy + mi rol; muestra/oculta la gestión de usuarios según sea admin.
 async function loadMe(){
   try{ const m=await api('/api/me'); USR_ME=m.user||USR_ME; IS_ADMIN=!!m.is_admin;
     const w=$('who'); if(w){ w.title=(IS_ADMIN?'Administrador':'Usuario')+' · '+(m.user||''); if(m.user) w.textContent=m.user; }  // B11: nombre visible también al recargar
     const badge=$('who_role'); if(badge){ badge.textContent=IS_ADMIN?'admin':'usuario'; badge.className='pill '+(IS_ADMIN?'active':'neutral'); badge.style.display='inline-block'; }  // UX-2: rol=etiqueta neutral, no advertencia
     const card=$('usr_card'); if(card) card.style.display=IS_ADMIN?'':'none';
+    aplicarSoloAdmin();
     if(IS_ADMIN) loadUsers();
   }catch(e){}
 }
@@ -3253,13 +3465,13 @@ async function editUser(u){
   const rec=((GV.usr&&GV.usr.all)||[]).find(x=>x.username===u)||{};
   const p=dsModal({title:'Editar «'+u+'»',okText:'Guardar cambios',
     html:'<div><label>Correo (para recuperación)</label><input id="eu_email" type="email" placeholder="correo@dominio.com" value="'+bcEsc(rec.email||'')+'"></div>'+
-         '<div style="margin-top:10px"><label>Contraseña nueva <span class="hint">— déjala vacía para no cambiarla</span></label><input id="eu_pw" type="password" placeholder="mínimo 8 caracteres" autocomplete="new-password"></div>'});
+         '<div style="margin-top:10px"><label>Contraseña nueva <span class="hint">— déjala vacía para no cambiarla</span></label><input id="eu_pw" type="password" placeholder="mínimo 12 caracteres" autocomplete="new-password"></div>'});
   const refEmail=$('eu_email'), refPw=$('eu_pw');
   if(!await p) return;
   const email=((refEmail&&refEmail.value)||'').trim(), pw=(refPw&&refPw.value)||'';
   const cambiaCorreo = email!==String(rec.email||'');
   if(!cambiaCorreo && !pw){ toast('Sin cambios','info'); return; }
-  if(pw && pw.length<8){ toast('La contraseña debe tener al menos 8 caracteres',true); return; }
+  if(pw && pw.length<12){ toast('La contraseña debe tener al menos 12 caracteres',true); return; }
   const cuerpo={username:u}; if(cambiaCorreo) cuerpo.email=email; if(pw) cuerpo.password=pw;
   try{ await api('/api/users/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cuerpo)});
     toast('✓ Usuario actualizado'+(pw?' (contraseña nueva)':'')); loadUsers();
@@ -3271,7 +3483,7 @@ async function deleteUser(u){ if(!await confirmModal('¿Borrar el usuario "'+u+'
   }catch(e){ toast(e.message||'Error',true); } }
 async function changePassword(){
   const cur=$('cp_cur').value, nw=$('cp_new').value; if(!cur||!nw){ toast('Completa ambos campos',true); return; }
-  if(nw.length<8){ toast('La nueva contraseña debe tener al menos 8 caracteres',true); return; }
+  if(nw.length<12){ toast('La nueva contraseña debe tener al menos 12 caracteres',true); return; }
   $('cp_status').textContent='Cambiando…';
   try{ const r=await fetch(BASE+'/api/auth/change-password',{method:'POST',headers:hdr({'Content-Type':'application/json'}),body:JSON.stringify({current:cur,new:nw})});
     const j=await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('error '+r.status));
@@ -3784,9 +3996,7 @@ async function refreshConn(){
 let CONN_TIMER=null;
 function connStartPolling(){ if(CONN_TIMER) return; refreshConn();
   CONN_TIMER=setInterval(()=>{ if(CRED && !document.hidden) refreshConn(); }, 60000); }
-// --- Expiración de sesión (cliente): re-login tras 8h o inactividad larga ---
-const SESSION_MAX_MS=8*3600*1000;
-function sessionFresca(){ try{ const t=parseInt(sessionStorage.getItem('cred_ts')||'0',10); return t && (Date.now()-t)<SESSION_MAX_MS; }catch(e){ return true; } }
+// La caducidad de sesión (8 h) la decide el servidor (cookie + registro en DynamoDB).
 // --- Onboarding: checklist de primeros pasos (desde la config) ---
 // UX-5: rutas viejas → nuevas (aliases durante la transición; retirar en 2-3 releases).
 const GO_ALIASES={'envios/componer':['enviar',''],'ajustes/telegram':['ajustes','conexiones'],'ajustes/whatsapp':['ajustes','conexiones'],'fuentes/fuente':['ajustes','captura']};
@@ -4179,8 +4389,7 @@ function a11yEnhance(){ try{
   ['telegram','whatsapp'].forEach(ch=>document.querySelectorAll('input[name=mode_'+ch+']').forEach(r=>r.addEventListener('change',()=>saveLists(ch))));
 }catch(e){} }
 function boot(){ a11yEnhance(); showTab((()=>{try{const s=localStorage.getItem('tab');return ['inicio','enviar','fuentes','envios','ajustes'].includes(s)?s:'inicio'}catch(e){return 'inicio'}})()); loadMe(); loadCfg(); loadQueue(); loadSubs(); loadDlq(); loadDashboard(); connStartPolling(); }
-if(CRED && !sessionFresca()){ logout(); }
-else if(CRED){ fetch(BASE+'/api/me',{headers:hdr()}).then(r=>{ if(r.ok){ $('login').style.display='none'; $('app').style.display='block'; boot(); } else { logout(); } }).catch(()=>{}); }
+fetch(BASE+'/api/me',{headers:hdr()}).then(r=>{ if(r.ok){ CRED='1'; $('login').style.display='none'; $('app').style.display='block'; boot(); } }).catch(()=>{});
 
 // ===== Componer y enviar (POST /api/broadcast) =====
 let BC_IMG_URL = '';           // URL (solo preview) devuelta tras subir un archivo a /api/image

@@ -409,7 +409,7 @@ El plan operativo (suite automatizada, smoke post-deploy, E2E manual por flujo y
 
 ## Estado actual
 
-- **Auditoría AppSec/UX 2026-11-25** ([docs/AUDITORIA.md](docs/AUDITORIA.md)): Ola 1 aplicada — bloqueo por usuario (no global), cabeceras de seguridad + `no-store` en la API, credenciales/conexiones (`whatsapp_service_url`, tokens, sesión, vincular/resetear WA y Telegram) **solo admin**, `api_hash` enmascarado, `bcEsc` completo. Pendiente Ola 2 (sesión por cookie HttpOnly en vez de Basic en `sessionStorage`, freno en DynamoDB) y Ola 3 (CSP sin inline, TOTP, Habeas Data). **Sin desplegar** a AWS.
+- **Auditoría AppSec/UX 2026-11-25** ([docs/AUDITORIA.md](docs/AUDITORIA.md)): Ola 1 aplicada — bloqueo por usuario (no global), cabeceras de seguridad + `no-store` en la API, credenciales/conexiones (`whatsapp_service_url`, tokens, sesión, vincular/resetear WA y Telegram) **solo admin**, `api_hash` enmascarado, `bcEsc` completo. **Ola 2 aplicada**: sesión por cookie `__Host-replica_sid` HttpOnly (login/logout en `/api/auth/*`, revocación por `sv`, CSRF por `X-Requested-With`), freno de intentos atómico en DynamoDB (`authfail#`), contraseñas 12+, conexiones en solo lectura para rol user; la ConfigTable gana TTL (`ttl`) → requiere actualizar la pila. Pendiente Ola 3 (CSP sin inline, TOTP, Habeas Data). **Sin desplegar** a AWS.
 
 > Notas revisadas por última vez tras la revisión post-rediseño (HEAD `2857100`, julio 2026). Verificar contra el código actual antes de afirmar como hecho.
 

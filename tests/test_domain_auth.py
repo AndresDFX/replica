@@ -26,7 +26,11 @@ class AuthTests(unittest.TestCase):
             self.assertFalse(verify_password("x", bad))
 
     def test_password_valida(self):
-        self.assertTrue(password_valida("12345678"))
+        self.assertTrue(password_valida("Montana-Verde-27"))
+        self.assertFalse(password_valida("12345678"))  # SEC-10: 12+
+        self.assertFalse(password_valida("password1234"))  # comun
+        self.assertFalse(password_valida("aaaaaaaaaaaaaa"))  # trivial
+        self.assertFalse(password_valida("ana-Montana-27", "ana"))  # contiene el usuario
         self.assertFalse(password_valida("corta"))
         self.assertFalse(password_valida(""))
 
