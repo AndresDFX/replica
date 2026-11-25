@@ -354,8 +354,7 @@ class AdminTests(unittest.TestCase):
     def test_lockout_tras_muchos_fallos(self):
         from unittest.mock import patch
 
-        admin._AUTH["fails"] = 0
-        admin._AUTH["locked_until"] = 0.0
+        admin._auth_desbloquear()
         ev = _event("GET", "/admin/api/config", auth=False)
         ev["headers"]["authorization"] = "Basic " + base64.b64encode(b"admin:mala").decode()
         for _ in range(admin._AUTH_MAX_FAILS):
@@ -363,8 +362,7 @@ class AdminTests(unittest.TestCase):
         # ahora bloqueado: incluso con credenciales correctas, rechaza durante el cooldown.
         # Devuelve 429 (no 401) para que el front distinga "espera N min" de credencial inválida.
         self.assertEqual(admin.lambda_handler(_event("GET", "/admin/api/config"), None)["statusCode"], 429)
-        admin._AUTH["fails"] = 0
-        admin._AUTH["locked_until"] = 0.0  # limpiar para no afectar otros tests
+        admin._auth_desbloquear()
 
     def test_config_enmascara_sesion(self):
         admin.config.cfg["telethon_session"] = "SECRETO_TOTAL"
@@ -397,7 +395,7 @@ class RoleTests(unittest.TestCase):
         admin.audit_store = FakeAudit()
         os.environ["ADMIN_USER"] = "admin"
         os.environ["ADMIN_PASSWORD"] = "secret123"
-        admin._AUTH["fails"] = 0; admin._AUTH["locked_until"] = 0.0
+        admin._auth_desbloquear()
         # Un usuario normal (rol "user") con contraseña válida para que pase el Basic Auth.
         admin.config.users = {
             "ana": {"email": "ana@x.com", "hash": admin.auth_dom.hash_password("clave1234"), "role": "user"},
@@ -416,6 +414,44 @@ class RoleTests(unittest.TestCase):
             "headers": {"authorization": f"Basic {token}"},
             "body": json.dumps(body) if body is not None else None,
         }
+
+    # --- Auditoría AppSec 2026-11 (SEC-01..04) ---
+    def test_sec01_el_bloqueo_es_por_usuario_y_no_tumba_al_admin(self):
+        for _ in range(admin._AUTH_MAX_FAILS + 1):
+            admin.lambda_handler(self._ev("GET", "/admin/api/me", user="atacante", pw="x"), None)
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me", user="atacante", pw="x"), None)["statusCode"], 429)
+        self.assertEqual(admin.lambda_handler(self._ev("GET", "/admin/api/me"), None)["statusCode"], 200)
+        admin._auth_desbloquear()
+
+    def test_sec02_cabeceras_de_seguridad_y_no_store(self):
+        r = admin.lambda_handler(self._ev("GET", "/admin/api/me"), None)
+        h = r["headers"]
+        self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"])
+        self.assertEqual(h["X-Frame-Options"], "DENY")
+        self.assertEqual(h["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(h["Cache-Control"], "no-store")
+        shell = admin.lambda_handler(self._ev("GET", "/admin"), None)["headers"]
+        self.assertIn("Strict-Transport-Security", shell)
+
+    def test_sec03_un_usuario_no_cambia_credenciales_ni_destinos(self):
+        for campo, valor in (("whatsapp_service_url", "https://evil.example"), ("bot_token", "1:x"),
+                             ("telethon_session", "S"), ("send_mode", "userbot")):
+            r = admin.lambda_handler(self._ev("POST", "/admin/api/config", {campo: valor}, user="ana", pw="clave1234"), None)
+            self.assertEqual(r["statusCode"], 403, campo)
+        for ruta in ("/admin/api/whatsapp/pair", "/admin/api/whatsapp/reset", "/admin/api/telethon/send-code",
+                     "/admin/api/telethon/sign-in", "/admin/api/telethon/logout"):
+            r = admin.lambda_handler(self._ev("POST", ruta, {}, user="ana", pw="clave1234"), None)
+            self.assertEqual(r["statusCode"], 403, ruta)
+
+    def test_sec03_un_usuario_si_cambia_lo_operativo(self):
+        r = admin.lambda_handler(self._ev("POST", "/admin/api/config", {"source_channel": "x"}, user="ana", pw="clave1234"), None)
+        self.assertNotEqual(r["statusCode"], 403)
+
+    def test_sec04_api_hash_enmascarado(self):
+        admin.config.cfg["telethon_api_hash"] = "HASH_SECRETO"
+        b = json.loads(admin.lambda_handler(self._ev("GET", "/admin/api/config"), None)["body"])
+        self.assertEqual(b["telethon_api_hash"], "")
+        self.assertTrue(b["telethon_api_hash_set"])
 
     def test_me_admin_es_admin(self):
         b = json.loads(admin.lambda_handler(self._ev("GET", "/admin/api/me"), None)["body"])
@@ -468,7 +504,7 @@ class TelegramAccountTests(unittest.TestCase):
         admin.subscribers = FakeSubs()  # evita que _ensure() haga I/O real (build_subscribers)
         admin.audit_store = FakeAudit()
         os.environ["ADMIN_USER"] = "admin"; os.environ["ADMIN_PASSWORD"] = "secret123"
-        admin._AUTH["fails"] = 0; admin._AUTH["locked_until"] = 0.0
+        admin._auth_desbloquear()
         self._wiring_orig = admin.wiring.build_telethon_account
 
     def tearDown(self):
@@ -906,8 +942,7 @@ class UsersUpdateTests(unittest.TestCase):
         admin.audit_store = FakeAudit()
         os.environ["ADMIN_USER"] = "admin"
         os.environ["ADMIN_PASSWORD"] = "secret123"
-        admin._AUTH["fails"] = 0
-        admin._AUTH["locked_until"] = 0.0
+        admin._auth_desbloquear()
         admin.config.users = {
             "ana": {"email": "ana@x.com", "hash": admin.auth_dom.hash_password("clave1234"), "role": "user"},
         }
@@ -1211,7 +1246,7 @@ class PasswordRevealTests(unittest.TestCase):
 
     # Los diez de la página, en orden de aparición. La lista es EXACTA a propósito: un campo
     # nuevo rompe la prueba y obliga a decidir si lleva ojo, en vez de colarse sin él.
-    IDS = ["lp", "fp_new", "bot_token", "tl_password", "telethon_session", "whatsapp_token",
+    IDS = ["lp", "fp_new", "bot_token", "telethon_api_hash", "tl_password", "telethon_session", "whatsapp_token",
            "usr_new_pw", "resend_api_key", "cp_cur", "cp_new"]
 
     @classmethod
@@ -1241,7 +1276,7 @@ class PasswordRevealTests(unittest.TestCase):
 
     def test_los_diez_campos_de_contrasena_siguen_siendo_diez(self):
         self.assertEqual([c["id"] for c in self.campos], self.IDS)
-        self.assertEqual(len(self.campos), 10)
+        self.assertEqual(len(self.campos), 11)
 
     def test_un_solo_enganche_sin_filtro_los_alcanza_a_todos(self):
         bloque = _bloque_del_ojo(self.html)
@@ -1539,10 +1574,10 @@ class PasswordRevealDomTests(unittest.TestCase):
     def test_los_diez_campos_acaban_con_su_ojo_dentro(self):
         campos = self.dom["inicial"]
         self.assertEqual([c["id"] for c in campos], self.ids)
-        self.assertEqual(len(campos), 10)
+        self.assertEqual(len(campos), 11)
         # Diez, contados: «al menos uno» dejaría pasar justo el fallo que importa (un campo suelto
         # que se quedó sin ojo).
-        self.assertEqual(sum(1 for c in campos if c["boton"]), 10)
+        self.assertEqual(sum(1 for c in campos if c["boton"]), 11)
         for c in campos:
             self.assertTrue(c["envuelto"], c["id"])           # el input queda DENTRO del <span class="pw">
             self.assertEqual(c["boton"]["clase"], "pw-ojo", c["id"])

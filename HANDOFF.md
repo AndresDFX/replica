@@ -409,6 +409,8 @@ El plan operativo (suite automatizada, smoke post-deploy, E2E manual por flujo y
 
 ## Estado actual
 
+- **Auditoría AppSec/UX 2026-11-25** ([docs/AUDITORIA.md](docs/AUDITORIA.md)): Ola 1 aplicada — bloqueo por usuario (no global), cabeceras de seguridad + `no-store` en la API, credenciales/conexiones (`whatsapp_service_url`, tokens, sesión, vincular/resetear WA y Telegram) **solo admin**, `api_hash` enmascarado, `bcEsc` completo. Pendiente Ola 2 (sesión por cookie HttpOnly en vez de Basic en `sessionStorage`, freno en DynamoDB) y Ola 3 (CSP sin inline, TOTP, Habeas Data). **Sin desplegar** a AWS.
+
 > Notas revisadas por última vez tras la revisión post-rediseño (HEAD `2857100`, julio 2026). Verificar contra el código actual antes de afirmar como hecho.
 
 - **Recopilación ACTIVA + envío PAUSADO** (`capture_enabled=True` por defecto, `sending_enabled=False`): el poller captura `@iproparts` y autoenvía cada lista a **Mensajes Guardados** del userbot (se ven como `📥 Capturada` en el panel), SIN difundir a nadie. El envío MANUAL (✍️ Enviar → ⚡ Ahora) SIEMPRE sale. Para encender el envío automático: en 🏠 Inicio elegir la lista por canal en «Lista del envío automático» (el panel lo exige) y activar el switch «Envíos automáticos activos».

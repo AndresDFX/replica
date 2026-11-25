@@ -33,7 +33,11 @@ logger.setLevel(logging.INFO)
 # Anti-fuerza-bruta del Basic Auth (en memoria, por contenedor): tras N fallos consecutivos se
 # bloquea por una ventana corta y cada fallo añade un pequeño retardo. Mitigación; el endurecimiento
 # real (WAF/dominio/multiusuario) es Fase 1. Best-effort entre contenedores (admin = baja concurrencia).
-_AUTH = {"fails": 0, "locked_until": 0.0}
+# SEC-01: el contador era GLOBAL, así que 5 intentos con un usuario cualquiera bloqueaban el panel a
+# TODOS (DoS trivial contra el admin legítimo). Ahora es por usuario (normalizado); tope de entradas
+# para que un barrido de nombres no infle la memoria del contenedor.
+_AUTH: dict[str, dict[str, float]] = {}
+_AUTH_MAX_ENTRADAS = 2000
 _AUTH_MAX_FAILS = 5
 _AUTH_LOCK_SECS = 300
 
@@ -112,6 +116,10 @@ _ENTEROS = ("batch_size", "wa_delay_min", "wa_delay_max", "window_tz")
 _BOOLS = ("whatsapp_enabled", "scheduling_enabled", "window_enabled", "capture_enabled", "sending_enabled",
           "tg_window_enabled", "wa_window_enabled")
 # Secretos que NO se sobreescriben con un valor vacío (para no borrarlos al guardar otros campos).
+_CAMPOS_SOLO_ADMIN = frozenset({
+    "bot_token", "telethon_api_id", "telethon_api_hash", "telethon_session",
+    "whatsapp_service_url", "whatsapp_token", "resend_api_key", "send_mode",
+})
 _NO_VACIAR = ("telethon_session", "telethon_api_id", "telethon_api_hash", "whatsapp_token", "bot_token", "resend_api_key")
 # El estado de sesión Telegram del header se sirve de la caché que mantiene el poller (que ya abre
 # Telethon cada ~5 min). Mientras la caché sea más fresca que esto, el panel NO abre conexión propia
@@ -180,25 +188,50 @@ def _planes_con_progreso() -> list[dict]:
 
 # --- auth -------------------------------------------------------------------
 
-def _auth_bloqueado() -> bool:
-    return _AUTH["locked_until"] > time.time()
+def _auth_estado(usuario: str) -> dict[str, float]:
+    k = (usuario or "").strip().lower()[:128]
+    st = _AUTH.get(k)
+    if st is None:
+        if len(_AUTH) >= _AUTH_MAX_ENTRADAS:
+            _AUTH.pop(next(iter(_AUTH)))
+        st = _AUTH[k] = {"fails": 0, "locked_until": 0.0}
+    return st
 
 
-def _auth_fallo() -> None:
+def _auth_desbloquear(usuario: str | None = None) -> None:
+    """Limpia el freno de un usuario (o de todos si es None)."""
+    if usuario is None:
+        _AUTH.clear()
+    else:
+        _AUTH.pop((usuario or "").strip().lower()[:128], None)
+
+
+def _auth_bloqueado(usuario: str) -> bool:
+    st = _AUTH.get((usuario or "").strip().lower()[:128])
+    return bool(st and st["locked_until"] > time.time())
+
+
+def _auth_segundos(usuario: str) -> int:
+    st = _AUTH.get((usuario or "").strip().lower()[:128]) or {"locked_until": 0.0}
+    return max(1, int(st["locked_until"] - time.time()))
+
+
+def _auth_fallo(usuario: str) -> None:
     # M16: NO dormir el handler (bloquea el worker Lambda y se factura). El freno real es el
     # lock 'locked_until' (devuelve 429 sin procesar) + el throttling de API Gateway.
-    # M26: si el cooldown anterior YA expiró, reiniciar el contador (si no, un solo fallo posterior
-    # re-bloquearía 5 min porque 'fails' seguía en 5).
-    if _AUTH["locked_until"] and _AUTH["locked_until"] <= time.time():
-        _AUTH["fails"] = 0
-        _AUTH["locked_until"] = 0.0
-    _AUTH["fails"] += 1
-    if _AUTH["fails"] >= _AUTH_MAX_FAILS:
-        _AUTH["locked_until"] = time.time() + _AUTH_LOCK_SECS
+    # M26: si el cooldown anterior YA expiró, reiniciar el contador.
+    st = _auth_estado(usuario)
+    if st["locked_until"] and st["locked_until"] <= time.time():
+        st["fails"] = 0
+        st["locked_until"] = 0.0
+    st["fails"] += 1
+    if st["fails"] >= _AUTH_MAX_FAILS:
+        st["locked_until"] = time.time() + _AUTH_LOCK_SECS
 
 
 def _autorizado(event: dict[str, Any]) -> bool:
-    if _auth_bloqueado():
+    usuario = _usuario_actual(event)
+    if _auth_bloqueado(usuario):
         return False  # en cooldown tras demasiados intentos fallidos
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
     auth = headers.get("authorization", "")
@@ -206,15 +239,14 @@ def _autorizado(event: dict[str, Any]) -> bool:
         return False
     try:
         usuario, _, clave = base64.b64decode(auth[6:]).decode("utf-8").partition(":")
-    except (binascii.Error, UnicodeDecodeError):
-        _auth_fallo()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        _auth_fallo("")
         return False
     ok = _verificar(usuario, clave)
     if ok:
-        _AUTH["fails"] = 0
-        _AUTH["locked_until"] = 0.0
+        _auth_desbloquear(usuario)
     else:
-        _auth_fallo()
+        _auth_fallo(usuario)
     return ok
 
 
@@ -719,6 +751,9 @@ def _config_publico() -> dict:
     cfg["bot_token"] = ""
     cfg["resend_api_key_set"] = bool(cfg.get("resend_api_key"))
     cfg["resend_api_key"] = ""
+    # SEC-04: el api_hash de Telegram también es credencial (con api_id + un código abre sesión).
+    cfg["telethon_api_hash_set"] = bool(cfg.get("telethon_api_hash"))
+    cfg["telethon_api_hash"] = ""
     return cfg
 
 
@@ -785,7 +820,40 @@ def _registrar_webhook() -> dict:
 
 # --- dispatcher -------------------------------------------------------------
 
+# SEC-02: cabeceras de seguridad en TODAS las respuestas del panel. El shell usa scripts y manejadores
+# inline, así que el CSP aún necesita 'unsafe-inline' (retirarlo exige sacar el JS a un asset con
+# nonce: Ola 3); aun así cierra clickjacking (frame-ancestors), <base>/plugins, exfiltración por
+# fetch a terceros (connect-src 'self') y envío de formularios fuera.
+_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; "
+        "manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+        "object-src 'none'; form-action 'self'")
+_SEC_HEADERS = {
+    "Content-Security-Policy": _CSP,
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    resp = _dispatch(event, context)
+    if isinstance(resp, dict):
+        h = dict(resp.get("headers") or {})
+        for k, v in _SEC_HEADERS.items():
+            h.setdefault(k, v)
+        # La API devuelve PII (contactos, teléfonos) y config: que no quede en cachés intermedias
+        # ni en el disco del navegador.
+        if str(h.get("Content-Type", "")).startswith("application/json"):
+            h["Cache-Control"] = "no-store"
+        resp["headers"] = h
+    return resp
+
+
+def _dispatch(event: dict[str, Any], context: Any) -> dict[str, Any]:
     http = event.get("requestContext", {}).get("http", {})
     method = http.get("method", "GET")
     raw = event.get("rawPath") or http.get("path") or "/admin"
@@ -821,8 +889,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # B12: si ya está bloqueado por intentos PREVIOS, 429 sin procesar (el front avisa "espera N min").
     # Se evalúa ANTES de _autorizado: el intento que DISPARA el lock aún devuelve 401 (credencial mala);
     # solo los intentos POSTERIORES, ya bloqueados, devuelven 429.
-    if _auth_bloqueado():
-        secs = max(1, int(_AUTH["locked_until"] - time.time()))
+    if _auth_bloqueado(_usuario_actual(event)):
+        secs = _auth_segundos(_usuario_actual(event))
         return _json({"error": f"Demasiados intentos. Espera ~{max(1, (secs + 59) // 60)} min."}, 429)
     if not _autorizado(event):
         return _json({"error": "unauthorized"}, 401)
@@ -960,6 +1028,13 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return _json(_config_publico())
         if sub == "/api/config" and method == "POST":
             cambios = _sanea_config(_body(event))
+            # SEC-03: credenciales y destinos de credenciales solo los toca un admin. Antes un rol
+            # 'user' podía apuntar whatsapp_service_url a su servidor y el backend le mandaba el
+            # whatsapp_token (exfiltración), o cambiar el bot/la sesión de Telegram.
+            sensibles = sorted(k for k in cambios if k in _CAMPOS_SOLO_ADMIN)
+            if sensibles and not _es_admin(event):
+                return _json({"error": "Solo un administrador puede cambiar credenciales o conexiones: "
+                              + ", ".join(sensibles) + "."}, 403)
             # A12: guardia de BACKEND (espejo de la del panel). Activar el ENVÍO automático exige tener
             # elegida una LISTA por canal; si no, un post del canal se difundiría a TODOS los contactos.
             # El front ya lo valida, pero una llamada directa a la API (o config heredada / lista borrada)
@@ -1150,6 +1225,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if sub == "/api/telegram/webhook" and method == "GET":
             return _telegram_api("getWebhookInfo", {})
         if sub == "/api/telegram/webhook" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede cambiar la conexión de Telegram."}, 403)
             return _registrar_webhook()
         if sub == "/api/broadcast" and method == "POST":
             cuerpo = _body(event)
@@ -1287,6 +1364,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _audit("schedules:borrar", sid)
             return _json({"ok": True})
         if sub == "/api/telethon/send-code" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede cambiar la conexión de Telegram."}, 403)
             from adapters import telethon_login
             cfg = config.get()
             api_id, api_hash = cfg.get("telethon_api_id"), cfg.get("telethon_api_hash")
@@ -1301,6 +1380,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _audit("telethon:send-code", phone[-4:] if phone else "")
             return _json({"ok": True, "sent": True})
         if sub == "/api/telethon/sign-in" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede cambiar la conexión de Telegram."}, 403)
             from adapters import telethon_login
             cfg = config.get()
             api_id, api_hash = cfg.get("telethon_api_id"), cfg.get("telethon_api_hash")
@@ -1327,6 +1408,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _audit("telethon:sign-in", "conectado @" + str((res.get("me") or {}).get("username") or ""))
             return _json({"ok": True, "connected": True, "me": res.get("me")})
         if sub == "/api/telethon/logout" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede cambiar la conexión de Telegram."}, 403)
             config.set({"telethon_session": ""})  # vacía la sesión (telethon_session SÍ se borra aquí)
             config.clear_login_temp()
             _audit("telethon:logout", "limpiar sesión userbot")
@@ -1429,12 +1512,16 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             _audit("whatsapp:reincluir", jid or "todos")
             return _whatsapp_proxy("/blocked/clear", body={"id": jid} if jid else {})
         if sub == "/api/whatsapp/pair" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede vincular o reiniciar WhatsApp."}, 403)
             numero = "".join(c for c in str(_body(event).get("number", "")) if c.isdigit())
             # Vincular BORRA la sesión guardada (clearOnStart en el servicio): queda auditado.
             # El número va enmascarado: la auditoría es consultable por cualquier usuario del panel.
             _audit("whatsapp:pair", f"vincular por código (número ···{numero[-4:]})" if numero else "vincular por código")
             return _whatsapp_proxy("/pair", timeout=25, body={"number": numero})
         if sub == "/api/whatsapp/reset" and method == "POST":
+            if not _es_admin(event):
+                return _json({"error": "Solo un administrador puede vincular o reiniciar WhatsApp."}, 403)
             _audit("whatsapp:reset", "limpiar sesión de WhatsApp")
             return _whatsapp_proxy("/reset", timeout=25, body={})
         if sub == "/api/whatsapp/sync" and method == "POST":
@@ -2430,7 +2517,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
     <button class="sec" style="width:100%;margin-top:8px" onclick="fpSend()">Enviar código</button>
     <div id="fp_step2" style="display:none;margin-top:10px">
       <label>Código (te llega por correo)</label><input id="fp_code" inputmode="numeric" placeholder="123456">
-      <label>Nueva contraseña (mínimo 8)</label><input id="fp_new" type="password">
+      <label>Nueva contraseña (mínimo 8)</label><input id="fp_new" type="password" autocomplete="new-password" minlength="8">
       <button style="width:100%;margin-top:8px" onclick="fpReset()">Restablecer contraseña</button>
     </div>
     <div class="hint" id="fp_status" style="margin-top:8px"></div>
@@ -2513,7 +2600,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
 
    <div class="section-label">Bot (crea o usa otro bot)</div>
    <label>Token del bot <span id="bot_status" class="hint"></span></label>
-   <input id="bot_token" type="password" placeholder="(pega el token de @BotFather)">
+   <input id="bot_token" type="password" autocomplete="off" placeholder="(pega el token de @BotFather)">
    <div class="hint">Crea un bot en <code>@BotFather</code> (<code>/newbot</code>), pega su token, pulsa <b>Guardar cuenta</b> y luego <b>Conectar bot</b>.</div>
    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
      <button class="sec" onclick="tgVerify()">Verificar bot</button>
@@ -2524,7 +2611,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
    <div class="section-label">Userbot (unir otra cuenta de Telegram)</div>
    <div class="row">
      <div><label>API ID</label><input id="telethon_api_id"></div>
-     <div><label>API Hash</label><input id="telethon_api_hash"></div>
+     <div><label>API Hash</label><input id="telethon_api_hash" type="password" autocomplete="off" placeholder="(pegar solo si quieres cambiarlo)"></div>
    </div>
    <label>Sesión de la cuenta <span id="sess_status" class="hint"></span></label>
    <div class="hint">Conéctate <b>sin scripts</b>: guarda primero el API ID y API Hash (botón de abajo), luego ingresa tu número, recibe el código por Telegram y confírmalo aquí mismo. La plataforma genera y guarda la sesión sola.</div>
@@ -2546,7 +2633,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
         vuelve a tapar. -->
    <details style="margin-top:14px" ontoggle="if(window.pwTapar)pwTapar()">
      <summary class="hint" style="cursor:pointer;font-weight:700">Avanzado: pegar StringSession</summary>
-     <input id="telethon_session" type="password" placeholder="(pega para unir/cambiar la cuenta)" style="margin-top:8px">
+     <input id="telethon_session" type="password" autocomplete="off" placeholder="(pega para unir/cambiar la cuenta)" style="margin-top:8px">
      <div class="hint">Alternativa manual: genérala con <code>scripts/generar_sesion.py</code>. Da acceso total a esa cuenta: trátala como secreto.</div>
    </details>
    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px">
@@ -2559,7 +2646,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
    <label style="display:flex;align-items:center;gap:8px;margin-top:0"><input type="checkbox" id="whatsapp_enabled" style="width:auto"> Reenviar también cada lista por WhatsApp</label>
    <label>URL del servicio WhatsApp</label><input id="whatsapp_service_url" placeholder="https://...onrender.com">
    <label>Token del servicio <span id="wa_tok_status" class="hint"></span></label>
-   <input id="whatsapp_token" type="password" placeholder="(pegar solo si quieres cambiarlo)">
+   <input id="whatsapp_token" type="password" autocomplete="off" placeholder="(pegar solo si quieres cambiarlo)">
    <button onclick="saveWhatsapp()">Guardar WhatsApp</button>
    <div style="margin-top:14px">
      <button class="ghost" onclick="waStatus()">Ver estado</button> <span id="wa_state" class="hint"></span>
@@ -2892,7 +2979,7 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
      <div><label>Correo (para recuperación)</label><input id="usr_new_email" placeholder="correo@dominio.com"></div>
    </div>
    <div class="row">
-     <div><label>Contraseña (mínimo 8)</label><input id="usr_new_pw" type="password"></div>
+     <div><label>Contraseña (mínimo 8)</label><input id="usr_new_pw" type="password" autocomplete="new-password" minlength="8"></div>
      <div><label>Rol<span class="help" tabindex="0" data-tip="Administrador: gestiona usuarios y todo lo demás. Usuario: hace todo MENOS gestionar usuarios.">ⓘ</span></label>
        <select id="usr_new_role"><option value="user" selected>Usuario (sin gestión de usuarios)</option><option value="admin">Administrador</option></select></div>
    </div>
@@ -2904,12 +2991,12 @@ html[data-theme="light"] .wa-code{color:var(--ok-tint)}
    <input id="mail_from" placeholder="Replica &lt;onboarding@resend.dev&gt;">
    <div class="hint">Para enviar a cualquier destinatario, verifica tu dominio en Resend. <code>onboarding@resend.dev</code> solo entrega al correo con el que te registraste.</div>
    <label>API key de Resend</label>
-   <input id="resend_api_key" type="password" placeholder="(pegar solo si quieres cambiarla)">
+   <input id="resend_api_key" type="password" autocomplete="off" placeholder="(pegar solo si quieres cambiarla)">
    <div style="margin-top:10px"><button onclick="saveEmail()">Guardar correo</button> <span id="mail_save_status" class="hint" style="margin-left:10px"></span></div>
   </div>
   <div class="card" data-tab="ajustes" data-sub="acceso"><h2>🔑 Cambiar mi contraseña</h2>
-   <label>Contraseña actual</label><input id="cp_cur" type="password">
-   <label>Nueva contraseña (mínimo 8)</label><input id="cp_new" type="password">
+   <label>Contraseña actual</label><input id="cp_cur" type="password" autocomplete="current-password">
+   <label>Nueva contraseña (mínimo 8)</label><input id="cp_new" type="password" autocomplete="new-password" minlength="8">
    <div style="margin-top:10px"><button onclick="changePassword()">Cambiar contraseña</button> <span id="cp_status" class="hint" style="margin-left:10px"></span></div>
   </div>
   <div class="card accent" data-tab="ajustes" data-sub="envio"><h2>Anti-baneo · ritmo de envío<span class="help" tabindex="0" data-tip="Cuántos mensajes por grupo (máx 150) y pausas ALEATORIAS entre mensajes para no parecer spam y reducir el riesgo de baneo. «Poco a poco» = un grupo a la vez.">ⓘ</span></h2>
@@ -3804,7 +3891,7 @@ function render(){
     const exP=!exM && matchP && !EXCEPT_TG.has(id); const exc=!exM && matchP && EXCEPT_TG.has(id);
     const label=s.name||'(sin nombre)'; const tr=document.createElement('tr');
     const pill = exM?'<span class="pill inactive">Excluido</span>':(exP?'<span class="pill pat">Excluido por nombre</span>':(exc?'<span class="pill exc-ok">Incluido a mano</span>':'<span class="pill active">Incluido</span>'));
-    tr.innerHTML=`<td><input type="checkbox" class="selrow" data-id="${s.chatId}"></td>`+
+    tr.innerHTML=`<td><input type="checkbox" class="selrow" data-id="${bcEsc(s.chatId)}"></td>`+
       `<td><b>${bcEsc(label)}</b><div class="hint" style="margin-top:2px;font-size:11px">${bcEsc(s.phone||s.chatId||'')}</div></td>`+
       `<td>${pill}</td>`;
     t.appendChild(tr); }); }
@@ -4330,7 +4417,7 @@ let BC_TIMER=null;
 const BC_POLL=4000;
 // Etiquetas de estado (vocabulario del usuario): creada / en proceso / capturada / enviada / parcial / fallida.
 const BC_STATUS={ queued:'🆕 Creada', sending:'⏳ En proceso', done:'✅ Enviada', failed:'❌ Fallida', partial:'⚠️ Parcial (con fallos)', captured:'📥 Capturada (no enviada)' };
-function bcEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function bcEsc(s){ return String(s==null?'':s).replace(/[&<>"'`]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c])); }
 
 // ===== Mensajes programados (módulo /api/schedules) =====
 const SG_DAYNAMES=['L','M','X','J','V','S','D'];  // 0=lunes .. 6=domingo
